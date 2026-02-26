@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"sync"
-	"time"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
@@ -23,11 +21,11 @@ import (
 // and the mautrix SDK for sending messages.
 type MatrixChannel struct {
 	*BaseChannel
-	config    config.MatrixConfig
-	client    *mautrix.Client
-	roomCache sync.Map // roomID -> *mautrix.Room
-	ctx       context.Context
-	cancel    context.CancelFunc
+	config config.MatrixConfig
+	client *mautrix.Client
+	syncer *mautrix.DefaultSyncer
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewMatrixChannel creates a new Matrix channel instance.
@@ -44,10 +42,15 @@ func NewMatrixChannel(cfg config.MatrixConfig, messageBus *bus.MessageBus) (*Mat
 		return nil, fmt.Errorf("failed to create matrix client: %w", err)
 	}
 
+	// Set up syncer
+	syncer := mautrix.NewDefaultSyncer()
+	client.Syncer = syncer
+
 	return &MatrixChannel{
 		BaseChannel: base,
 		config:      cfg,
 		client:      client,
+		syncer:      syncer,
 	}, nil
 }
 
@@ -69,234 +72,206 @@ func (c *MatrixChannel) Start(ctx context.Context) error {
 		"homeserver":  c.config.HomeserverURL,
 	})
 
+	// Register event handlers
+	c.syncer.OnEventType(event.EventMessage, c.onMessage)
+	c.syncer.OnEventType(event.StateMember, c.onMemberEvent)
+
 	// Start sync loop in background
-	go c.syncLoop()
+	go func() {
+		err := c.client.Sync()
+		if err != nil && c.ctx.Err() == nil {
+			logger.ErrorCF("matrix", "Sync failed", map[string]any{
+				"error": err.Error(),
+			})
+		}
+	}()
 
 	c.setRunning(true)
 	logger.InfoC("matrix", "Matrix channel started")
 	return nil
 }
 
-// syncLoop continuously syncs with the Matrix server to receive messages.
-func (c *MatrixChannel) syncLoop() {
-	syncParams := &mautrix.ReqSync{}
-	nextBatch := ""
-
-	for {
-		select {
-		case <-c.ctx.Done():
-			logger.InfoC("matrix", "Matrix sync loop stopped")
-			return
-		default:
-		}
-
-		if nextBatch != "" {
-			syncParams.Since = nextBatch
-		}
-
-		resp, err := c.client.Sync(c.ctx, syncParams)
-		if err != nil {
-			logger.ErrorCF("matrix", "Sync error", map[string]any{
-				"error": err.Error(),
-			})
-			// Wait before retrying
-			select {
-			case <-time.After(5 * time.Second):
-			case <-c.ctx.Done():
-				return
-			}
-			continue
-		}
-
-		nextBatch = resp.NextBatch
-
-		// Process rooms
-		for roomID, room := range resp.Rooms.Join {
-			c.processRoomEvents(roomID, room)
-		}
-
-		// Process invited rooms (auto-join)
-		for roomID, invite := range resp.Rooms.Invite {
-			c.processInvite(roomID, invite)
-		}
+// onMemberEvent handles room membership events (for auto-joining invites).
+func (c *MatrixChannel) onMemberEvent(ctx context.Context, evt *event.Event) {
+	if evt.Type != event.StateMember {
+		return
 	}
-}
 
-// processInvite handles room invitations by auto-joining.
-func (c *MatrixChannel) processInvite(roomID id.RoomID, invite mautrix.InvitedRoom) {
-	// Check if inviter is allowed
-	inviterID := id.UserID("")
-	for _, event := range invite.State.StateEvents {
-		if event.Type == event.StateMember && event.StateKey != nil {
-			// Extract sender (inviter)
-			inviterID = event.Sender
-			break
-		}
+	// Check if this is an invite to the bot
+	membership, ok := evt.Content.Raw["membership"].(string)
+	if !ok || membership != "invite" {
+		return
+	}
+
+	// Check if the state key is the bot's user ID
+	if evt.StateKey == nil || *evt.StateKey != c.config.UserID {
+		return
 	}
 
 	// Check allowlist
-	if !c.IsAllowed(string(inviterID)) {
+	if !c.IsAllowed(evt.Sender.String()) {
 		logger.DebugCF("matrix", "Rejecting room invite from non-allowed user", map[string]any{
-			"room_id":   roomID,
-			"inviter":   inviterID,
+			"room_id": evt.RoomID,
+			"inviter": evt.Sender,
 		})
 		return
 	}
 
 	// Auto-join the room
-	_, err := c.client.JoinRoom(c.ctx, roomID.String(), nil)
+	_, err := c.client.JoinRoomByID(ctx, evt.RoomID)
 	if err != nil {
 		logger.ErrorCF("matrix", "Failed to join room", map[string]any{
-			"room_id": roomID,
+			"room_id": evt.RoomID,
 			"error":   err.Error(),
 		})
 		return
 	}
 
 	logger.InfoCF("matrix", "Auto-joined room", map[string]any{
-		"room_id": roomID,
-		"inviter": inviterID,
+		"room_id": evt.RoomID,
+		"inviter": evt.Sender,
 	})
 }
 
-// processRoomEvents processes events from a room.
-func (c *MatrixChannel) processRoomEvents(roomID id.RoomID, room mautrix.JoinedRoom) {
-	for _, evt := range room.Timeline.Events {
-		if evt.Type != event.EventMessage {
-			continue
-		}
+// onMessage handles incoming messages.
+func (c *MatrixChannel) onMessage(ctx context.Context, evt *event.Event) {
+	// Skip own messages
+	if evt.Sender.String() == c.config.UserID {
+		return
+	}
 
-		// Skip own messages
-		if evt.Sender.String() == c.config.UserID {
-			continue
-		}
+	// Check allowlist
+	if !c.IsAllowed(evt.Sender.String()) {
+		logger.DebugCF("matrix", "Message rejected by allowlist", map[string]any{
+			"sender_id": evt.Sender,
+			"room_id":   evt.RoomID,
+		})
+		return
+	}
 
-		// Check allowlist
-		if !c.IsAllowed(evt.Sender.String()) {
-			logger.DebugCF("matrix", "Message rejected by allowlist", map[string]any{
-				"sender_id": evt.Sender,
-				"room_id":   roomID,
-			})
-			continue
-		}
+	// Parse message content
+	msgContent := evt.Content.AsMessage()
+	if msgContent == nil {
+		logger.DebugC("matrix", "Message content is nil")
+		return
+	}
 
-		// Skip edits
-		if evt.Content.RelatesTo != nil && evt.Content.RelatesTo.RelType == "m.replace" {
-			continue
-		}
+	// Skip edits
+	if msgContent.RelatesTo != nil && msgContent.RelatesTo.Type == "m.replace" {
+		return
+	}
 
-		senderID := evt.Sender.String()
-		content := ""
-		var mediaPaths []string
-		localFiles := []string{}
+	senderID := evt.Sender.String()
+	roomID := evt.RoomID.String()
+	content := ""
+	var mediaPaths []string
+	localFiles := []string{}
 
-		defer func() {
-			for _, file := range localFiles {
-				if err := os.Remove(file); err != nil {
-					logger.DebugCF("matrix", "Failed to cleanup temp file", map[string]any{
-						"file":  file,
-						"error": err.Error(),
-					})
-				}
+	defer func() {
+		for _, file := range localFiles {
+			if err := os.Remove(file); err != nil {
+				logger.DebugCF("matrix", "Failed to cleanup temp file", map[string]any{
+					"file":  file,
+					"error": err.Error(),
+				})
 			}
-		}()
-
-		// Extract message content
-		msgContent := evt.Content
-		msgType := msgContent.MsgType
-
-		if msgType == event.MsgText {
-			content = msgContent.Body
-			// Strip bot mention if present
-			content = c.stripBotMention(content, roomID.String())
-		} else if msgType == event.MsgImage {
-			localPath := c.downloadMedia(roomID, evt.ID, msgContent.Body, "image")
-			if localPath != "" {
-				localFiles = append(localFiles, localPath)
-				mediaPaths = append(mediaPaths, localPath)
-				content = "[image]"
-			}
-		} else if msgType == event.MsgFile {
-			localPath := c.downloadMedia(roomID, evt.ID, msgContent.Body, "file")
-			if localPath != "" {
-				localFiles = append(localFiles, localPath)
-				mediaPaths = append(mediaPaths, localPath)
-				content = "[file]"
-			}
-		} else if msgType == event.MsgAudio {
-			localPath := c.downloadMedia(roomID, evt.ID, msgContent.Body, "audio")
-			if localPath != "" {
-				localFiles = append(localFiles, localPath)
-				mediaPaths = append(mediaPaths, localPath)
-				content = "[audio]"
-			}
-		} else if msgType == event.MsgVideo {
-			localPath := c.downloadMedia(roomID, evt.ID, msgContent.Body, "video")
-			if localPath != "" {
-				localFiles = append(localFiles, localPath)
-				mediaPaths = append(mediaPaths, localPath)
-				content = "[video]"
-			}
-		} else if msgType == event.MsgLocation {
-			content = fmt.Sprintf("[location: %s]", msgContent.Body)
-		} else {
-			content = fmt.Sprintf("[%s]", msgType)
 		}
+	}()
 
-		if strings.TrimSpace(content) == "" {
-			continue
+	// Extract message content
+	msgType := msgContent.MsgType
+
+	if msgType == event.MsgText {
+		content = msgContent.Body
+		// Strip bot mention if present
+		content = c.stripBotMention(content, roomID)
+	} else if msgType == event.MsgImage {
+		localPath := c.downloadMedia(evt.ID, msgContent.Body, "image")
+		if localPath != "" {
+			localFiles = append(localFiles, localPath)
+			mediaPaths = append(mediaPaths, localPath)
+			content = "[image]"
 		}
+	} else if msgType == event.MsgFile {
+		localPath := c.downloadMedia(evt.ID, msgContent.Body, "file")
+		if localPath != "" {
+			localFiles = append(localFiles, localPath)
+			mediaPaths = append(mediaPaths, localPath)
+			content = "[file]"
+		}
+	} else if msgType == event.MsgAudio {
+		localPath := c.downloadMedia(evt.ID, msgContent.Body, "audio")
+		if localPath != "" {
+			localFiles = append(localFiles, localPath)
+			mediaPaths = append(mediaPaths, localPath)
+			content = "[audio]"
+		}
+	} else if msgType == event.MsgVideo {
+		localPath := c.downloadMedia(evt.ID, msgContent.Body, "video")
+		if localPath != "" {
+			localFiles = append(localFiles, localPath)
+			mediaPaths = append(mediaPaths, localPath)
+			content = "[video]"
+		}
+	} else if msgType == event.MsgLocation {
+		content = fmt.Sprintf("[location: %s]", msgContent.Body)
+	} else {
+		content = fmt.Sprintf("[%s]", msgType)
+	}
 
-		// Determine peer kind and ID
-		peerKind := "room"
-		peerID := roomID.String()
+	if strings.TrimSpace(content) == "" {
+		return
+	}
 
-		// Check if it's a direct message
+	// Determine peer kind and ID
+	peerKind := "room"
+	peerID := roomID
+
+	// Check if it's a direct message (simplified check)
+	if strings.HasPrefix(roomID, "!") && len(strings.Split(roomID, ":")) == 2 {
+		// Could be DM, check room members
 		if c.isDirectMessage(roomID) {
 			peerKind = "direct"
 			peerID = senderID
 		}
-
-		metadata := map[string]string{
-			"platform":   "matrix",
-			"room_id":    roomID.String(),
-			"event_id":   evt.ID.String(),
-			"peer_kind":  peerKind,
-			"peer_id":    peerID,
-			"sender_id":  senderID,
-		}
-
-		logger.DebugCF("matrix", "Received message", map[string]any{
-			"sender_id": senderID,
-			"room_id":   roomID,
-			"preview":   utils.Truncate(content, 50),
-		})
-
-		// Send typing notification
-		c.sendTyping(roomID)
-
-		c.HandleMessage(senderID, roomID.String(), content, mediaPaths, metadata)
 	}
+
+	metadata := map[string]string{
+		"platform":   "matrix",
+		"room_id":    roomID,
+		"event_id":   evt.ID.String(),
+		"peer_kind":  peerKind,
+		"peer_id":    peerID,
+		"sender_id":  senderID,
+	}
+
+	logger.DebugCF("matrix", "Received message", map[string]any{
+		"sender_id": senderID,
+		"room_id":   roomID,
+		"preview":   utils.Truncate(content, 50),
+	})
+
+	// Send typing notification
+	c.sendTyping(roomID)
+
+	c.HandleMessage(senderID, roomID, content, mediaPaths, metadata)
 }
 
 // isDirectMessage checks if a room is a direct message.
-func (c *MatrixChannel) isDirectMessage(roomID id.RoomID) bool {
+func (c *MatrixChannel) isDirectMessage(roomID string) bool {
 	// Try to get DM status
-	dmEvent, err := c.client.GetAccountData(c.ctx, id.AccountDataDirectChats)
+	dmEvent := make(map[string]interface{})
+	err := c.client.GetAccountData(c.ctx, "m.direct", &dmEvent)
 	if err != nil {
 		return false
 	}
 
-	if dmEvent.Content.Raw == nil {
-		return false
-	}
-
 	// Check if room is in DM list
-	if dmList, ok := dmEvent.Content.Raw["m.direct"].(map[string]interface{}); ok {
+	if dmList, ok := dmEvent["m.direct"].(map[string]interface{}); ok {
 		for _, rooms := range dmList {
 			if roomList, ok := rooms.([]interface{}); ok {
 				for _, room := range roomList {
-					if room == roomID.String() {
+					if room == roomID {
 						return true
 					}
 				}
@@ -325,9 +300,22 @@ func (c *MatrixChannel) stripBotMention(content, roomID string) string {
 }
 
 // downloadMedia downloads media from Matrix.
-func (c *MatrixChannel) downloadMedia(roomID id.RoomID, eventID id.EventID, body, mediaType string) string {
-	// Build media URL
-	mediaURL := c.client.BuildMediaURL(eventID.String())
+func (c *MatrixChannel) downloadMedia(eventID id.EventID, body, mediaType string) string {
+	// Build media URL using the event ID string directly
+	// Event ID format: $<hash>:<homeserver>
+	eventIDStr := eventID.String()
+	var homeServer string
+	if idx := strings.Index(eventIDStr, ":"); idx > 0 {
+		homeServer = eventIDStr[idx+1:]
+	} else {
+		// Fallback to config homeserver
+		homeServer = c.config.UserID[strings.Index(c.config.UserID, ":")+1:]
+	}
+
+	mediaURL := fmt.Sprintf("%s/_matrix/media/v3/download/%s/%s",
+		c.client.HomeserverURL.String(),
+		homeServer,
+		eventIDStr)
 
 	ext := "." + mediaType
 	if mediaType == "image" {
@@ -336,7 +324,7 @@ func (c *MatrixChannel) downloadMedia(roomID id.RoomID, eventID id.EventID, body
 		ext = ""
 	}
 
-	filename := fmt.Sprintf("matrix_%s%s", eventID, ext)
+	filename := fmt.Sprintf("matrix_%s%s", eventIDStr, ext)
 	return utils.DownloadFile(mediaURL, filename, utils.DownloadOptions{
 		LoggerPrefix: "matrix",
 		ExtraHeaders: map[string]string{
@@ -346,8 +334,13 @@ func (c *MatrixChannel) downloadMedia(roomID id.RoomID, eventID id.EventID, body
 }
 
 // sendTyping sends a typing notification.
-func (c *MatrixChannel) sendTyping(roomID id.RoomID) {
-	_, err := c.client.SendTyping(c.ctx, roomID, true, 30000)
+func (c *MatrixChannel) sendTyping(roomID string) {
+	roomIDObj := id.RoomID(roomID)
+	userIDObj := id.UserID(c.config.UserID)
+	// Send typing event directly
+	_, err := c.client.SendStateEvent(c.ctx, roomIDObj, event.Type{"m.typing", event.StateEventType}, userIDObj.String(), map[string]bool{
+		"typing": true,
+	})
 	if err != nil {
 		logger.DebugCF("matrix", "Failed to send typing notification", map[string]any{
 			"error": err.Error(),
