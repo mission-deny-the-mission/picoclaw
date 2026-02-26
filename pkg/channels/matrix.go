@@ -2,11 +2,14 @@ package channels
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"maunium.net/go/mautrix"
+	mautrixcrypto "maunium.net/go/mautrix/crypto"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -24,6 +27,7 @@ type MatrixChannel struct {
 	config config.MatrixConfig
 	client *mautrix.Client
 	syncer *mautrix.DefaultSyncer
+	crypto *mautrixcrypto.OlmMachine
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -44,13 +48,39 @@ func NewMatrixChannel(cfg config.MatrixConfig, messageBus *bus.MessageBus) (*Mat
 
 	// Set up syncer
 	syncer := mautrix.NewDefaultSyncer()
+	syncer.ParseEventContent = true
+	// Set up filter to receive room messages
+	syncer.FilterJSON = &mautrix.Filter{
+		Room: &mautrix.RoomFilter{
+			Timeline: &mautrix.FilterPart{
+				Limit: 20,
+			},
+		},
+	}
 	client.Syncer = syncer
+
+	// Set up crypto for E2EE with in-memory store
+	memoryStore := mautrixcrypto.NewMemoryStore(nil)
+	crypto := mautrixcrypto.NewOlmMachine(client, nil, memoryStore, nil)
+	// Note: Don't assign to client.Crypto as OlmMachine doesn't implement CryptoHelper
+	// We use the OlmMachine directly for encryption/decryption
+	
+	// Load crypto store
+	loadErr := crypto.Load(context.Background())
+	if loadErr != nil {
+		logger.WarnCF("matrix", "Failed to load crypto store (continuing without persistence)", map[string]any{
+			"error": loadErr.Error(),
+		})
+	} else {
+		logger.InfoC("matrix", "Matrix crypto store loaded")
+	}
 
 	return &MatrixChannel{
 		BaseChannel: base,
 		config:      cfg,
 		client:      client,
 		syncer:      syncer,
+		crypto:      crypto,
 	}, nil
 }
 
@@ -72,23 +102,178 @@ func (c *MatrixChannel) Start(ctx context.Context) error {
 		"homeserver":  c.config.HomeserverURL,
 	})
 
-	// Register event handlers
-	c.syncer.OnEventType(event.EventMessage, c.onMessage)
-	c.syncer.OnEventType(event.StateMember, c.onMemberEvent)
+	// Register sync handler to process room events
+	c.syncer.OnSync(c.processSync)
+
+	logger.InfoC("matrix", "Matrix event handlers registered")
+	logger.InfoCF("matrix", "Syncer ParseEventContent enabled", map[string]any{
+		"parse_content": c.syncer.ParseEventContent,
+	})
 
 	// Start sync loop in background
 	go func() {
-		err := c.client.Sync()
-		if err != nil && c.ctx.Err() == nil {
-			logger.ErrorCF("matrix", "Sync failed", map[string]any{
-				"error": err.Error(),
-			})
+		logger.InfoC("matrix", "Starting Matrix sync loop")
+		for {
+			select {
+			case <-c.ctx.Done():
+				logger.InfoC("matrix", "Matrix sync loop stopped")
+				return
+			default:
+			}
+
+			err := c.client.Sync()
+			if err != nil {
+				if c.ctx.Err() == nil {
+					logger.ErrorCF("matrix", "Sync error, retrying in 5s", map[string]any{
+						"error": err.Error(),
+					})
+					time.Sleep(5 * time.Second)
+				} else {
+					return
+				}
+			}
 		}
 	}()
 
 	c.setRunning(true)
 	logger.InfoC("matrix", "Matrix channel started")
 	return nil
+}
+
+// processSync handles sync responses and processes room events.
+func (c *MatrixChannel) processSync(ctx context.Context, resp *mautrix.RespSync, since string) bool {
+	logger.InfoCF("matrix", "Sync response received", map[string]any{
+		"rooms_joined":  len(resp.Rooms.Join),
+		"rooms_invited": len(resp.Rooms.Invite),
+		"next_batch":    resp.NextBatch,
+		"since":         since,
+	})
+
+	// Let crypto process the sync response first (handles key sharing, etc.)
+	if c.crypto != nil {
+		c.crypto.ProcessSyncResponse(ctx, resp, since)
+	}
+
+	// Process joined rooms
+	for roomID, room := range resp.Rooms.Join {
+		timelineCount := len(room.Timeline.Events)
+		stateCount := len(room.State.Events)
+		logger.InfoCF("matrix", "Processing joined room", map[string]any{
+			"room_id":        roomID,
+			"timeline_count": timelineCount,
+			"state_count":    stateCount,
+			"limited":        room.Timeline.Limited,
+		})
+		if timelineCount == 0 {
+			continue
+		}
+		for _, evt := range room.Timeline.Events {
+			// Set the room ID on the event since mautrix doesn't populate it from sync
+			evt.RoomID = roomID
+			
+			logger.InfoCF("matrix", "Processing event", map[string]any{
+				"type":     evt.Type,
+				"sender":   evt.Sender.String(),
+				"event_id": evt.ID.String(),
+				"room_id":  evt.RoomID,
+			})
+			
+			// Handle encrypted events
+			if evt.Type == event.EventEncrypted && c.crypto != nil {
+				// Manually parse encrypted content if not already parsed
+				if evt.Content.Parsed == nil {
+					var encryptedContent event.EncryptedEventContent
+					err := json.Unmarshal(evt.Content.VeryRaw, &encryptedContent)
+					if err != nil {
+						logger.DebugCF("matrix", "Failed to parse encrypted content", map[string]any{
+							"event_id": evt.ID.String(),
+							"error":    err.Error(),
+						})
+						continue
+					}
+					evt.Content.Parsed = &encryptedContent
+				}
+				// Decrypt the event
+				decrypted, err := c.crypto.DecryptMegolmEvent(ctx, evt)
+				if err != nil {
+					logger.WarnCF("matrix", "Failed to decrypt event (may need key share)", map[string]any{
+						"error":    err.Error(),
+						"event_id": evt.ID.String(),
+					})
+					// Request room key if decryption fails
+					c.crypto.HandleEncryptedEvent(ctx, evt)
+					continue
+				}
+				logger.InfoCF("matrix", "Decrypted event", map[string]any{
+					"type":     decrypted.Type,
+					"event_id": evt.ID.String(),
+				})
+				if decrypted.Type == event.EventMessage {
+					c.onMessage(ctx, decrypted)
+				}
+				continue
+			}
+			
+			if evt.Type == event.EventMessage {
+				c.onMessage(ctx, evt)
+			} else if evt.Type == event.StateMember {
+				c.onMemberEvent(ctx, evt)
+			}
+		}
+	}
+
+	// Process invited rooms (auto-join)
+	for roomID, invite := range resp.Rooms.Invite {
+		logger.InfoCF("matrix", "Processing room invite", map[string]any{
+			"room_id": roomID,
+			"event_count": len(invite.State.Events),
+		})
+		
+		// Check if any invite event is for the bot
+		for _, evt := range invite.State.Events {
+			if evt.Type != event.StateMember {
+				continue
+			}
+			
+			// Check if this is an invite to the bot
+			membership, ok := evt.Content.Raw["membership"].(string)
+			if !ok || membership != "invite" {
+				continue
+			}
+			
+			// Check if the state key is the bot's user ID
+			if evt.StateKey == nil || *evt.StateKey != c.config.UserID {
+				continue
+			}
+			
+			// Check allowlist
+			if !c.IsAllowed(evt.Sender.String()) {
+				logger.DebugCF("matrix", "Rejecting room invite from non-allowed user", map[string]any{
+					"room_id": roomID,
+					"inviter": evt.Sender,
+				})
+				continue
+			}
+			
+			// Auto-join the room
+			_, err := c.client.JoinRoomByID(ctx, roomID)
+			if err != nil {
+				logger.ErrorCF("matrix", "Failed to join room", map[string]any{
+					"room_id": roomID,
+					"error":   err.Error(),
+				})
+			} else {
+				logger.InfoCF("matrix", "Auto-joined room", map[string]any{
+					"room_id": roomID,
+					"inviter": evt.Sender,
+				})
+				// Wait a moment for the join to propagate
+				time.Sleep(2 * time.Second)
+			}
+		}
+	}
+
+	return true
 }
 
 // onMemberEvent handles room membership events (for auto-joining invites).
@@ -135,8 +320,16 @@ func (c *MatrixChannel) onMemberEvent(ctx context.Context, evt *event.Event) {
 
 // onMessage handles incoming messages.
 func (c *MatrixChannel) onMessage(ctx context.Context, evt *event.Event) {
+	logger.InfoCF("matrix", "Received message event", map[string]any{
+		"sender":   evt.Sender,
+		"room_id":  evt.RoomID,
+		"room_id_str": evt.RoomID.String(),
+		"event_id": evt.ID,
+	})
+
 	// Skip own messages
 	if evt.Sender.String() == c.config.UserID {
+		logger.DebugC("matrix", "Skipping own message")
 		return
 	}
 
@@ -163,6 +356,13 @@ func (c *MatrixChannel) onMessage(ctx context.Context, evt *event.Event) {
 
 	senderID := evt.Sender.String()
 	roomID := evt.RoomID.String()
+	
+	logger.InfoCF("matrix", "Processing message before HandleMessage", map[string]any{
+		"sender_id": senderID,
+		"room_id":   roomID,
+		"room_id_empty": roomID == "",
+	})
+
 	content := ""
 	var mediaPaths []string
 	localFiles := []string{}
@@ -369,12 +569,35 @@ func (c *MatrixChannel) Send(ctx context.Context, msg bus.OutboundMessage) error
 
 	roomID := id.RoomID(msg.ChatID)
 
-	// Send as text message
-	_, err := c.client.SendMessageEvent(ctx, roomID, event.EventMessage, &event.MessageEventContent{
+	// Create message content
+	content := &event.MessageEventContent{
 		MsgType: event.MsgText,
 		Body:    msg.Content,
-	})
+	}
 
+	// Try to encrypt if crypto is available
+	if c.crypto != nil {
+		encrypted, err := c.crypto.EncryptMegolmEvent(ctx, roomID, event.EventMessage, content)
+		if err != nil {
+			logger.DebugCF("matrix", "Skipping encryption (not an encrypted room or no session)", map[string]any{
+				"error":   err.Error(),
+				"room_id": roomID,
+			})
+			// Fall through to send unencrypted
+		} else {
+			_, err := c.client.SendMessageEvent(ctx, roomID, event.EventEncrypted, encrypted)
+			if err != nil {
+				return fmt.Errorf("failed to send encrypted matrix message: %w", err)
+			}
+			logger.DebugCF("matrix", "Encrypted message sent", map[string]any{
+				"room_id": roomID,
+			})
+			return nil
+		}
+	}
+
+	// Send unencrypted
+	_, err := c.client.SendMessageEvent(ctx, roomID, event.EventMessage, content)
 	if err != nil {
 		return fmt.Errorf("failed to send matrix message: %w", err)
 	}
