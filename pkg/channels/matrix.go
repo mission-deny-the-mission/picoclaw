@@ -49,12 +49,16 @@ func NewMatrixChannel(cfg config.MatrixConfig, messageBus *bus.MessageBus) (*Mat
 	// Set up syncer
 	syncer := mautrix.NewDefaultSyncer()
 	syncer.ParseEventContent = true
-	// Set up filter to receive room messages
+	// Set up filter to receive room messages and toDevice events (needed for E2EE keys)
 	syncer.FilterJSON = &mautrix.Filter{
 		Room: &mautrix.RoomFilter{
 			Timeline: &mautrix.FilterPart{
 				Limit: 20,
 			},
+		},
+		// Include to_device events for E2EE key sharing
+		AccountData: &mautrix.FilterPart{
+			Limit: 10,
 		},
 	}
 	client.Syncer = syncer
@@ -153,6 +157,28 @@ func (c *MatrixChannel) processSync(ctx context.Context, resp *mautrix.RespSync,
 	if c.crypto != nil {
 		c.crypto.ProcessSyncResponse(ctx, resp, since)
 	}
+	
+	// Process toDevice events for E2EE key sharing
+	if c.crypto != nil && len(resp.ToDevice.Events) > 0 {
+		logger.DebugCF("matrix", "Processing toDevice events", map[string]any{
+			"event_count": len(resp.ToDevice.Events),
+		})
+		for _, evt := range resp.ToDevice.Events {
+			c.crypto.HandleToDeviceEvent(ctx, evt)
+		}
+	}
+	
+	// Handle device list changes for E2EE
+	if c.crypto != nil {
+		deviceLists := resp.DeviceLists
+		if len(deviceLists.Changed) > 0 || len(deviceLists.Left) > 0 {
+			logger.DebugCF("matrix", "Processing device lists", map[string]any{
+				"changed": len(deviceLists.Changed),
+				"left":    len(deviceLists.Left),
+			})
+			c.crypto.HandleDeviceLists(ctx, &deviceLists, since)
+		}
+	}
 
 	// Process joined rooms
 	for roomID, room := range resp.Rooms.Join {
@@ -164,6 +190,23 @@ func (c *MatrixChannel) processSync(ctx context.Context, resp *mautrix.RespSync,
 			"state_count":    stateCount,
 			"limited":        room.Timeline.Limited,
 		})
+
+		// Check for encryption state events to enable outbound encryption
+		if c.crypto != nil {
+			for _, evt := range room.State.Events {
+				if evt.Type == event.StateEncryption {
+					logger.InfoCF("matrix", "Processing encryption state event", map[string]any{
+						"room_id":   roomID,
+						"algorithm": evt.Content.Raw["algorithm"],
+					})
+				}
+				// Handle member events for key sharing
+				if evt.Type == event.StateMember {
+					c.crypto.HandleMemberEvent(ctx, evt)
+				}
+			}
+		}
+
 		if timelineCount == 0 {
 			continue
 		}
@@ -177,7 +220,7 @@ func (c *MatrixChannel) processSync(ctx context.Context, resp *mautrix.RespSync,
 				"event_id": evt.ID.String(),
 				"room_id":  evt.RoomID,
 			})
-			
+
 			// Handle encrypted events
 			if evt.Type == event.EventEncrypted && c.crypto != nil {
 				// Manually parse encrypted content if not already parsed
@@ -579,17 +622,18 @@ func (c *MatrixChannel) Send(ctx context.Context, msg bus.OutboundMessage) error
 	if c.crypto != nil {
 		encrypted, err := c.crypto.EncryptMegolmEvent(ctx, roomID, event.EventMessage, content)
 		if err != nil {
-			logger.DebugCF("matrix", "Skipping encryption (not an encrypted room or no session)", map[string]any{
+			logger.WarnCF("matrix", "Sending unencrypted (encryption setup required)", map[string]any{
 				"error":   err.Error(),
 				"room_id": roomID,
+				"hint":    "Bot needs to receive encryption keys from another device",
 			})
 			// Fall through to send unencrypted
 		} else {
-			_, err := c.client.SendMessageEvent(ctx, roomID, event.EventEncrypted, encrypted)
-			if err != nil {
-				return fmt.Errorf("failed to send encrypted matrix message: %w", err)
+			_, sendErr := c.client.SendMessageEvent(ctx, roomID, event.EventEncrypted, encrypted)
+			if sendErr != nil {
+				return fmt.Errorf("failed to send encrypted matrix message: %w", sendErr)
 			}
-			logger.DebugCF("matrix", "Encrypted message sent", map[string]any{
+			logger.InfoCF("matrix", "Encrypted message sent", map[string]any{
 				"room_id": roomID,
 			})
 			return nil
@@ -602,7 +646,7 @@ func (c *MatrixChannel) Send(ctx context.Context, msg bus.OutboundMessage) error
 		return fmt.Errorf("failed to send matrix message: %w", err)
 	}
 
-	logger.DebugCF("matrix", "Message sent", map[string]any{
+	logger.DebugCF("matrix", "Unencrypted message sent", map[string]any{
 		"room_id": roomID,
 	})
 
