@@ -236,6 +236,22 @@ func (c *MatrixChannel) processSync(ctx context.Context, resp *mautrix.RespSync,
 					Algorithm: id.Algorithm(algorithm),
 				}
 				c.stateStore.SetEncryptionEvent(ctx, roomID, encryptionContent)
+				
+				// Create outbound group session for this encrypted room
+				// This shares keys with all room members
+				logger.DebugCF("matrix", "Creating outbound group session", map[string]any{
+					"room_id": roomID,
+				})
+				shareErr := c.crypto.ShareGroupSession(ctx, roomID, []id.UserID{})
+				if shareErr != nil {
+					logger.WarnCF("matrix", "Could not create outbound session yet", map[string]any{
+						"error": shareErr.Error(),
+					})
+				} else {
+					logger.InfoCF("matrix", "Outbound group session created", map[string]any{
+						"room_id": roomID,
+					})
+				}
 			}
 
 			// Handle encrypted events
