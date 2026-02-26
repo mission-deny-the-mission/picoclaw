@@ -106,6 +106,13 @@
       "webhook_path": "/webhook/line",
       "allow_from": []
     },
+    "matrix": {
+      "enabled": false,
+      "homeserver_url": "https://matrix-client.matrix.org",
+      "access_token": "YOUR_MATRIX_ACCESS_TOKEN",
+      "user_id": "@your_bot:matrix.org",
+      "allow_from": []
+    },
     "onebot": {
       "enabled": false,
       "ws_url": "ws://127.0.0.1:3001",

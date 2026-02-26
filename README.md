@@ -282,7 +282,7 @@ That's it! You have a working AI assistant in 2 minutes.
 
 ## 💬 Chat Apps
 
-Talk to your picoclaw through Telegram, Discord, DingTalk, LINE, or WeCom
+Talk to your picoclaw through Telegram, Discord, DingTalk, LINE, Matrix, or WeCom
 
 | Channel      | Setup                              |
 | ------------ | ---------------------------------- |
@@ -291,6 +291,7 @@ Talk to your picoclaw through Telegram, Discord, DingTalk, LINE, or WeCom
 | **QQ**       | Easy (AppID + AppSecret)           |
 | **DingTalk** | Medium (app credentials)           |
 | **LINE**     | Medium (credentials + webhook URL) |
+| **Matrix**   | Easy (access token + user ID)      |
 | **WeCom**    | Medium (CorpID + webhook setup)    |
 
 <details>
@@ -491,6 +492,66 @@ picoclaw gateway
 > In group chats, the bot responds only when @mentioned. Replies quote the original message.
 
 > **Docker Compose**: Add `ports: ["18791:18791"]` to the `picoclaw-gateway` service to expose the webhook port.
+
+</details>
+
+<details>
+<summary><b>Matrix</b></summary>
+
+**1. Create a Matrix bot user**
+
+- Use any Matrix client (Element, FluffyChat, etc.) to create a new account
+- Or create a bot user on your preferred homeserver (matrix.org, t2bot.io, or self-hosted)
+- Note the **User ID** (e.g., `@picoclaw:matrix.org`)
+- Generate an **Access Token** using your client or API
+
+**2. Get your Access Token**
+
+*Method 1: Using Element Web/Desktop*
+- Settings → Help & About → Advanced → Access Token → Copy token
+
+*Method 2: Using API*
+```bash
+curl -X POST https://matrix.org/_matrix/client/v3/login \
+  -H "Content-Type: application/json" \
+  -d '{"type":"m.login.password","user":"your_username","password":"your_password"}'
+```
+
+**3. Configure**
+
+```json
+{
+  "channels": {
+    "matrix": {
+      "enabled": true,
+      "homeserver_url": "https://matrix-client.matrix.org",
+      "access_token": "YOUR_ACCESS_TOKEN",
+      "user_id": "@your_bot:matrix.org",
+      "allow_from": ["@your_user_id:matrix.org"]
+    }
+  }
+}
+```
+
+> **Homeserver URLs**: 
+> - matrix.org: `https://matrix-client.matrix.org`
+> - t2bot.io: `https://t2bot.io`
+> - Self-hosted: `https://your-homeserver.com`
+
+**4. Invite the bot**
+
+- Invite your bot user to any room or start a direct message
+- The bot will auto-join rooms when invited (if inviter is in `allow_from`)
+
+**5. Run**
+
+```bash
+picoclaw gateway
+```
+
+> **Note**: Matrix uses sync-based message receiving, so no webhook setup is needed. The bot will continuously sync with the homeserver to receive messages in real-time.
+
+> **Security**: Keep your access token secure! It provides full access to your Matrix account.
 
 </details>
 

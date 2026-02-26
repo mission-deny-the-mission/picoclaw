@@ -199,6 +199,7 @@ type ChannelsConfig struct {
 	DingTalk DingTalkConfig `json:"dingtalk"`
 	Slack    SlackConfig    `json:"slack"`
 	LINE     LINEConfig     `json:"line"`
+	Matrix   MatrixConfig   `json:"matrix"`
 	OneBot   OneBotConfig   `json:"onebot"`
 	WeCom    WeComConfig    `json:"wecom"`
 	WeComApp WeComAppConfig `json:"wecom_app"`
@@ -269,6 +270,17 @@ type LINEConfig struct {
 	WebhookPort        int                 `json:"webhook_port"         env:"PICOCLAW_CHANNELS_LINE_WEBHOOK_PORT"`
 	WebhookPath        string              `json:"webhook_path"         env:"PICOCLAW_CHANNELS_LINE_WEBHOOK_PATH"`
 	AllowFrom          FlexibleStringSlice `json:"allow_from"           env:"PICOCLAW_CHANNELS_LINE_ALLOW_FROM"`
+}
+
+type MatrixConfig struct {
+	Enabled       bool                `json:"enabled"        env:"PICOCLAW_CHANNELS_MATRIX_ENABLED"`
+	HomeserverURL string              `json:"homeserver_url" env:"PICOCLAW_CHANNELS_MATRIX_HOMESERVER_URL"`
+	AccessToken   string              `json:"access_token"   env:"PICOCLAW_CHANNELS_MATRIX_ACCESS_TOKEN"`
+	UserID        string              `json:"user_id"        env:"PICOCLAW_CHANNELS_MATRIX_USER_ID"`
+	WebhookHost   string              `json:"webhook_host"   env:"PICOCLAW_CHANNELS_MATRIX_WEBHOOK_HOST"`
+	WebhookPort   int                 `json:"webhook_port"   env:"PICOCLAW_CHANNELS_MATRIX_WEBHOOK_PORT"`
+	WebhookPath   string              `json:"webhook_path"   env:"PICOCLAW_CHANNELS_MATRIX_WEBHOOK_PATH"`
+	AllowFrom     FlexibleStringSlice `json:"allow_from"     env:"PICOCLAW_CHANNELS_MATRIX_ALLOW_FROM"`
 }
 
 type OneBotConfig struct {
