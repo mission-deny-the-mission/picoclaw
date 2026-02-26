@@ -24,12 +24,13 @@ import (
 // and the mautrix SDK for sending messages.
 type MatrixChannel struct {
 	*BaseChannel
-	config config.MatrixConfig
-	client *mautrix.Client
-	syncer *mautrix.DefaultSyncer
-	crypto *mautrixcrypto.OlmMachine
-	ctx    context.Context
-	cancel context.CancelFunc
+	config     config.MatrixConfig
+	client     *mautrix.Client
+	syncer     *mautrix.DefaultSyncer
+	crypto     *mautrixcrypto.OlmMachine
+	stateStore *MemoryStateStore
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
 // NewMatrixChannel creates a new Matrix channel instance.
@@ -63,9 +64,10 @@ func NewMatrixChannel(cfg config.MatrixConfig, messageBus *bus.MessageBus) (*Mat
 	}
 	client.Syncer = syncer
 
-	// Set up crypto for E2EE with in-memory store
-	memoryStore := mautrixcrypto.NewMemoryStore(nil)
-	crypto := mautrixcrypto.NewOlmMachine(client, nil, memoryStore, nil)
+	// Set up crypto for E2EE with in-memory stores
+	cryptoStore := mautrixcrypto.NewMemoryStore(nil)
+	stateStore := NewMemoryStateStore()
+	crypto := mautrixcrypto.NewOlmMachine(client, nil, cryptoStore, stateStore)
 	// Note: Don't assign to client.Crypto as OlmMachine doesn't implement CryptoHelper
 	// We use the OlmMachine directly for encryption/decryption
 	
@@ -85,6 +87,7 @@ func NewMatrixChannel(cfg config.MatrixConfig, messageBus *bus.MessageBus) (*Mat
 		client:      client,
 		syncer:      syncer,
 		crypto:      crypto,
+		stateStore:  stateStore,
 	}, nil
 }
 
@@ -220,6 +223,20 @@ func (c *MatrixChannel) processSync(ctx context.Context, resp *mautrix.RespSync,
 				"event_id": evt.ID.String(),
 				"room_id":  evt.RoomID,
 			})
+
+			// Handle encryption state events to enable outbound encryption
+			if evt.Type == event.StateEncryption && c.stateStore != nil {
+				algorithm, _ := evt.Content.Raw["algorithm"].(string)
+				logger.InfoCF("matrix", "Processing encryption state event", map[string]any{
+					"room_id":   roomID,
+					"algorithm": algorithm,
+				})
+				// Mark room as encrypted in state store
+				encryptionContent := &event.EncryptionEventContent{
+					Algorithm: id.Algorithm(algorithm),
+				}
+				c.stateStore.SetEncryptionEvent(ctx, roomID, encryptionContent)
+			}
 
 			// Handle encrypted events
 			if evt.Type == event.EventEncrypted && c.crypto != nil {
@@ -620,12 +637,27 @@ func (c *MatrixChannel) Send(ctx context.Context, msg bus.OutboundMessage) error
 
 	// Try to encrypt if crypto is available
 	if c.crypto != nil {
-		encrypted, err := c.crypto.EncryptMegolmEvent(ctx, roomID, event.EventMessage, content)
-		if err != nil {
+		// Check if room is encrypted using state store
+		if c.stateStore != nil {
+			isEncrypted, err := c.stateStore.IsEncrypted(ctx, roomID)
+			if err != nil {
+				logger.DebugCF("matrix", "Could not check encryption status", map[string]any{
+					"error": err.Error(),
+				})
+			} else {
+				logger.DebugCF("matrix", "Room encryption status", map[string]any{
+					"room_id":      roomID,
+					"is_encrypted": isEncrypted,
+				})
+			}
+		}
+		
+		encrypted, encryptErr := c.crypto.EncryptMegolmEvent(ctx, roomID, event.EventMessage, content)
+		if encryptErr != nil {
 			logger.WarnCF("matrix", "Sending unencrypted (encryption setup required)", map[string]any{
-				"error":   err.Error(),
+				"error":   encryptErr.Error(),
 				"room_id": roomID,
-				"hint":    "Bot needs to receive encryption keys from another device",
+				"hint":    "Bot needs to create outbound session first",
 			})
 			// Fall through to send unencrypted
 		} else {
