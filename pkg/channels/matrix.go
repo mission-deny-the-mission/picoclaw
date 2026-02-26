@@ -256,6 +256,14 @@ func (c *MatrixChannel) processSync(ctx context.Context, resp *mautrix.RespSync,
 
 			// Handle encrypted events
 			if evt.Type == event.EventEncrypted && c.crypto != nil {
+				// Skip own encrypted messages (we sent them, no need to decrypt)
+				if evt.Sender.String() == c.config.UserID {
+					logger.DebugCF("matrix", "Skipping own encrypted message", map[string]any{
+						"event_id": evt.ID.String(),
+					})
+					continue
+				}
+				
 				// Manually parse encrypted content if not already parsed
 				if evt.Content.Parsed == nil {
 					var encryptedContent event.EncryptedEventContent
