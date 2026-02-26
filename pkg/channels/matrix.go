@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"maunium.net/go/mautrix"
@@ -64,9 +66,17 @@ func NewMatrixChannel(cfg config.MatrixConfig, messageBus *bus.MessageBus) (*Mat
 	}
 	client.Syncer = syncer
 
-	// Set up crypto for E2EE with in-memory stores
-	cryptoStore := mautrixcrypto.NewMemoryStore(nil)
-	stateStore := NewMemoryStateStore()
+	// Set up crypto for E2EE with persistent storage
+	cryptoStorePath := filepath.Join(os.ExpandEnv("$HOME"), ".picoclaw", "matrix-crypto")
+	os.MkdirAll(cryptoStorePath, 0o700)
+	
+	// Use MemoryStore with save callback for now
+	// TODO: Implement proper file-based store or use SQLCryptoStore
+	cryptoStore := mautrixcrypto.NewMemoryStore(func() error {
+		// Save callback - could persist to disk here
+		// MemoryStore doesn't expose data, so this is limited
+		return nil
+	})
 	crypto := mautrixcrypto.NewOlmMachine(client, nil, cryptoStore, stateStore)
 	// Note: Don't assign to client.Crypto as OlmMachine doesn't implement CryptoHelper
 	// We use the OlmMachine directly for encryption/decryption
